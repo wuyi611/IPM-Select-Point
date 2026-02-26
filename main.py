@@ -6,15 +6,27 @@ from datetime import datetime
 
 
 class IPMPointCollector:
-    def __init__(self, rtsp_url, xml_path, display_width=960):
+    def __init__(self, rtsp_url, xml_path, display_width=960, use_undistort=True):
         self.rtsp_url = rtsp_url
         self.display_width = display_width
-        self.mtx, self.dist, self.new_mtx = self.load_xml_params(xml_path)
+        self.use_undistort = use_undistort  # 是否开启内参矫正变量
+
+        # 只有在需要矫正时才加载 XML
+        if self.use_undistort:
+            self.mtx, self.dist, self.new_mtx = self.load_xml_params(xml_path)
+        else:
+            print(">>> 提示: 内参矫正已关闭，将使用视频原始帧。")
+            self.mtx, self.dist, self.new_mtx = None, None, None
+
         self.cap = cv2.VideoCapture(rtsp_url)
-        self.image_orig = None  # 存储去畸变后的全分辨率原图
+        self.image_orig = None  # 存储处理后的全分辨率原图
         self.display_scale = 1.0
 
     def load_xml_params(self, xml_path):
+        if not os.path.exists(xml_path):
+            print(f"警告: 找不到配置文件 {xml_path}, 强制关闭矫正。")
+            self.use_undistort = False
+            return None, None, None
         try:
             tree = ET.parse(xml_path)
             root = tree.getroot()
@@ -28,10 +40,11 @@ class IPMPointCollector:
                     get_data('camera_distortion', (1, 5)),
                     get_data('new_camera_matrix', (3, 3)))
         except Exception as e:
-            print(f"XML解析失败: {e}")
-            exit()
+            print(f"XML解析失败: {e}, 强制关闭矫正。")
+            self.use_undistort = False
+            return None, None, None
 
-    def get_undistorted_snapshot(self):
+    def get_snapshot(self):
         print("正在连接 RTSP 并获取最新帧...")
         if not self.cap.isOpened():
             self.cap = cv2.VideoCapture(self.rtsp_url)
@@ -42,9 +55,13 @@ class IPMPointCollector:
         ret, frame = self.cap.read()
         if not ret: return False
 
-        # --- 核心步骤：畸变矫正 ---
-        # 得到去畸变后的全分辨率图像
-        self.image_orig = cv2.undistort(frame, self.mtx, self.dist, None, self.new_mtx)
+        # --- 核心判断步骤 ---
+        if self.use_undistort:
+            # 得到去畸变后的全分辨率图像
+            self.image_orig = cv2.undistort(frame, self.mtx, self.dist, None, self.new_mtx)
+        else:
+            # 直接使用原始帧
+            self.image_orig = frame.copy()
 
         h, w = self.image_orig.shape[:2]
         self.display_scale = self.display_width / w
@@ -52,35 +69,32 @@ class IPMPointCollector:
         return True
 
     def screenshot_mode(self):
-        """进入截图预览模式"""
+        mode_title = "Undistorted" if self.use_undistort else "Original"
         print("\n" + "=" * 40)
-        print(">>> 进入去畸变预览模式 <<<")
+        print(f">>> 进入 [{mode_title}] 预览模式 <<<")
         print("操作指令:")
-        print("  [S] - 保存当前去畸变截图 (全分辨率)")
+        print("  [S] - 保存当前截图 (全分辨率)")
         print("  [空格/回车] - 确认并进入下一步(选点)")
         print("  [ESC/Q] - 退出程序")
         print("=" * 40)
 
-        window_name = "Undistorted Preview (Screenshot Mode)"
+        window_name = f"Preview - {mode_title} Mode"
         cv2.namedWindow(window_name)
 
         while True:
             cv2.imshow(window_name, self.image_display)
             key = cv2.waitKey(1) & 0xFF
 
-            # 保存截图
             if key == ord('s') or key == ord('S'):
                 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                filename = f"undistorted_snap_{timestamp}.jpg"
+                prefix = "undistorted" if self.use_undistort else "original"
+                filename = f"{prefix}_snap_{timestamp}.jpg"
                 cv2.imwrite(filename, self.image_orig)
-                print(f" [已保存] 畸变矫正图: {os.path.abspath(filename)}")
+                print(f" [已保存] 截图: {os.path.abspath(filename)}")
 
-            # 下一步
             elif key == ord(' ') or key == 13:
-                print("确认无误，进入选点流程...")
                 break
 
-            # 退出
             elif key == 27 or key == ord('q'):
                 cv2.destroyAllWindows()
                 exit()
@@ -103,15 +117,12 @@ class IPMPointCollector:
         return [a[0] + ua * (b[0] - a[0]), a[1] + ua * (b[1] - a[1])]
 
     def run(self):
-        # 1. 获取图像
-        if not self.get_undistorted_snapshot():
+        if not self.get_snapshot():
             print("错误：无法连接流或读取图像")
             return
 
-        # 2. 截图确认阶段 (新增)
         self.screenshot_mode()
 
-        # 3. 选点模式选择
         print("\n模式选择: [1] 虚拟点推算  [2] 直接选取4点")
         mode = input("请选择: ")
 
@@ -120,25 +131,22 @@ class IPMPointCollector:
         context = {'temp_pts': [], 'img': self.image_display.copy()}
         cv2.setMouseCallback("Calibration", self.mouse_callback, context)
 
+        # ... (后续选点逻辑保持不变)
         if mode == '1':
             print("\n[阶段 1] 点击4个点以推算交点 (1-2线, 3-4线)")
             while len(context['temp_pts']) < 4:
                 cv2.imshow("Calibration", context['img'])
                 if cv2.waitKey(20) & 0xFF == 27: return
-
             v_point = self.get_intersect(context['temp_pts'][0], context['temp_pts'][1],
                                          context['temp_pts'][2], context['temp_pts'][3])
-
             print(f">>> 虚拟点坐标: {v_point}")
             idx = int(input("该点序号(1-4): ") or 1) - 1
             final_points[max(0, min(idx, 3))] = v_point
-
             print(f"[阶段 2] 请点击剩下的 3 个点")
             context['temp_pts'] = []
             while len(context['temp_pts']) < 3:
                 cv2.imshow("Calibration", context['img'])
                 if cv2.waitKey(20) & 0xFF == 27: return
-
             click_idx = 0
             for i in range(4):
                 if final_points[i] is None:
@@ -151,7 +159,6 @@ class IPMPointCollector:
                 if cv2.waitKey(20) & 0xFF == 27: return
             final_points = context['temp_pts']
 
-        # 4. 保存结果
         print("\n正在保存坐标数据...")
         with open("calib_points.txt", "w") as f:
             for i, pt in enumerate(final_points):
@@ -165,5 +172,9 @@ class IPMPointCollector:
 if __name__ == "__main__":
     RTSP_URL = "rtsp://192.168.9.83:554/11"
     XML_PATH = "camera_params.xml"
-    tool = IPMPointCollector(RTSP_URL, XML_PATH)
+
+    # 在这里控制是否开启矫正
+    USE_UNDISTORT = False
+
+    tool = IPMPointCollector(RTSP_URL, XML_PATH, use_undistort=USE_UNDISTORT)
     tool.run()
